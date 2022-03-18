@@ -7,13 +7,13 @@
 
 import Foundation
 
-public struct AccountStore {
+public struct AccountStore: Store {
     var id: String
     var username: String
     var email: String
 }
 
-public enum AccountMutation: Mutation {
+public enum AccountMutation: Action {
     public func reduce(error: Error) -> AccountMutation {
         .error(error)
     }
@@ -21,4 +21,3 @@ public enum AccountMutation: Mutation {
     case login
     case error(Error)
 }
-
