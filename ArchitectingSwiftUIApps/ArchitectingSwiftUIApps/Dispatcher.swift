@@ -11,155 +11,86 @@ public protocol Action {
     func reduce(error: Error) -> Self
 }
 
-public protocol Store {}
+public struct SideEffect<D> {
+    public typealias Operation = (Dispatcher, D) async throws -> Void
+    private let _operation: Operation?
+    public static var noop: SideEffect<D> { SideEffect<D>() }
 
-public enum SideEffect {
-    public typealias Operation = (Dispatcher) async throws -> Void
-    case noop
-    case sideEffect(Operation)
+    public init(_ operation: @escaping Operation) {
+        _operation = operation
+    }
 
-    func callAsFunction(_ dispatcher: Dispatcher) async throws {
-        switch self {
-        case .noop:
-            break
-        case let .sideEffect(value):
-            try await value(dispatcher)
+    private init() {
+        _operation = nil
+    }
+
+    fileprivate var hasOperation: Bool {
+        _operation != nil
+    }
+
+    fileprivate func callAsFunction(_ dispatcher: Dispatcher, dependencies: D) async throws {
+        guard let operation = _operation else {
+            assertionFailure()
+            return
         }
+        try await operation(dispatcher, dependencies)
     }
 }
 
-public class Service<M, S> where M: Action, S: Store {
-    public typealias Reducer = (inout S, M) -> SideEffect
-    public private(set) var store: S
+private struct Service {
+    typealias Operation = (Dispatcher) async throws -> Void
+    private let _reduce: (Action) async -> Operation?
 
-    private let _reducer: Reducer
-
-    public init(_ initialState: S, reducer: @escaping Reducer) {
-        _reducer = reducer
-        store = initialState
-    }
-
-    func mutate(action: M) -> SideEffect {
-        _reducer(&store, action)
-    }
-}
-
-public struct AnyService: Hashable {
-    private let _mutate: (Action) -> SideEffect
-    private let id: ObjectIdentifier
-    public let store: Store
-
-    public init<M, S>(_ service: Service<M, S>) {
-        _mutate = { action in
-            if let action = action as? M {
-                return service.mutate(action: action)
+    init<S, D, A>(store: Store<S>,
+                  dependencies: D,
+                  reducer: @escaping (inout S, A) -> SideEffect<D>)
+    {
+        _reduce = { action in
+            if let action = action as? A {
+                var state = await store.state
+                let sideEffect = reducer(&state, action)
+                await store.update(state: state)
+                if sideEffect.hasOperation {
+                    return {
+                        try await sideEffect($0, dependencies: dependencies)
+                    }
+                }
             }
-            return .noop
+            return nil
         }
-        store = service.store
-        id = ObjectIdentifier(service)
     }
 
-    public func mutate(action: Action) -> SideEffect {
-        _mutate(action)
-    }
-
-    public static func == (lhs: AnyService, rhs: AnyService) -> Bool {
-        lhs.id == rhs.id
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(id)
-    }
-}
-
-public class AnyObserver: Hashable {
-    private let _receive: (Store) -> Void
-    private let id: UUID
-
-    public init<S>(_ receive: @escaping (S) -> Void) where S: Store {
-        _receive = { store in
-            if let store = store as? S {
-                receive(store)
-            }
-        }
-        id = UUID()
-    }
-
-    public func receive(store: Store) {
-        _receive(store)
-    }
-
-    public static func == (lhs: AnyObserver, rhs: AnyObserver) -> Bool {
-        lhs.id == rhs.id
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(id)
-    }
-}
-
-public class WatchToken {
-    private let _closure: () -> Void
-    public init(_ closure: @escaping () -> Void) {
-        _closure = closure
-    }
-
-    deinit {
-        _closure()
+    func mutate<A: Action>(action: A) async -> Operation? {
+        await _reduce(action)
     }
 }
 
 public actor Dispatcher {
-    private var _services: Set<AnyService> = []
-    private var _observers: Set<AnyObserver> = []
+    private var _services: [Service] = []
 
-    public func register<M, S>(service: Service<M, S>) {
-        let service = AnyService(service)
-        _services.insert(service)
+    public func register<S, D, A>(store: Store<S>,
+                                  dependencies: D,
+                                  reducer: @escaping (inout S, A) -> SideEffect<D>) where A: Action
+    {
+        let service = Service(store: store,
+                              dependencies: dependencies,
+                              reducer: reducer)
+        _services.append(service)
     }
 
-    public func unregister<M, S>(service: Service<M, S>) {
-        let service = AnyService(service)
-        _services.remove(service)
-    }
-
-    public func watch<S>(_ store: S.Type, receive: @escaping (S) -> Void) -> WatchToken where S: Store {
-        let observer = AnyObserver(receive)
-        _observers.insert(observer)
-
-        return WatchToken {
-            Task { [weak self] in
-                await self?.unwatch(observer: observer)
-            }
-        }
-    }
-
-    private func unwatch(observer: AnyObserver) {
-        _observers.remove(observer)
-    }
-
-    public func mutate<M>(_ action: M) where M: Action {
-        var sideEffects: [SideEffect] = []
+    public func mutate<M>(_ action: M) async where M: Action {
+        var sideEffects: [Service.Operation] = []
         for service in _services {
-            let sideEffect = service.mutate(action: action)
-            if case .sideEffect = sideEffect {
+            if let sideEffect = await service.mutate(action: action) {
                 sideEffects.append(sideEffect)
             }
-
-            for observer in _observers {
-                observer.receive(store: service.store)
-            }
         }
 
-        let finalSideEffects = sideEffects
-        Task {
-            for sideEffect in finalSideEffects {
-                do {
-                    try await sideEffect(self)
-                } catch {
-                    mutate(action.reduce(error: error))
-                }
+        for sideEffect in sideEffects {
+            do {
+                try await sideEffect(self)
+            } catch {
+                await mutate(action.reduce(error: error))
             }
         }
     }

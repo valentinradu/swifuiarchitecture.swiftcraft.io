@@ -7,17 +7,24 @@
 
 import Foundation
 
-public struct AccountStore: Store {
+public struct AccountState {
     var id: String
     var username: String
     var email: String
 }
 
-public enum AccountMutation: Action {
-    public func reduce(error: Error) -> AccountMutation {
+public enum AccountAction: Action {
+    public func reduce(error: Error) -> AccountAction {
         .error(error)
     }
-    
+
     case login
     case error(Error)
+}
+
+public struct AccountDependencies {}
+
+public func accountReducer(state: inout AccountState,
+                           action: AccountAction) -> SideEffect<AccountDependencies> {
+    .noop
 }
