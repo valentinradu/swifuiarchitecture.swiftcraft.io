@@ -25,6 +25,9 @@ public enum AccountAction: Action {
 public struct AccountDependencies {}
 
 public func accountReducer(state: inout AccountState,
-                           action: AccountAction) -> SideEffect<AccountDependencies> {
-    .noop
+                           action: AccountAction) -> SideEffect<AccountDependencies>
+{
+    SideEffect { [state] dispatcher, dependencies in
+        print(state.id)
+    }
 }
