@@ -14,7 +14,7 @@ public struct AccountState {
 }
 
 public enum AccountAction: Action {
-    public func reduce(error: Error) -> AccountAction {
+    public func transform(error: Error) -> AccountAction {
         .error(error)
     }
 
@@ -24,10 +24,18 @@ public enum AccountAction: Action {
 
 public struct AccountDependencies {}
 
-public func accountReducer(state: inout AccountState,
-                           action: AccountAction) -> SideEffect<AccountDependencies>
-{
-    SideEffect { [state] dispatcher, dependencies in
-        print(state.id)
+struct AccountService: Service {
+    func initialState(dependencies: AccountDependencies) async -> AccountState {
+        AccountState(id: "", username: "", email: "")
+    }
+    
+    func dependencies() async -> AccountDependencies {
+        AccountDependencies()
+    }
+
+    static func reduce(state: inout AccountState, action: AccountAction) -> OldSideEffect<AccountDependencies> {
+        OldSideEffect { [state] _, _ in
+            print(state.id)
+        }
     }
 }
