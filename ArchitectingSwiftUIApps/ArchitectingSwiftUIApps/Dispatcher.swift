@@ -11,7 +11,7 @@ public protocol Action {
     func transform(error: Error) -> Self
 }
 
-public actor Store<State> {
+public actor Store<State>: ObservableObject {
     private var state: State
 
     public init(_ state: State) {
@@ -19,7 +19,8 @@ public actor Store<State> {
     }
 
     public func update<T>(_ closure: (inout State) -> T) -> T {
-        closure(&state)
+        objectWillChange.send()
+        return closure(&state)
     }
 }
 
@@ -33,55 +34,25 @@ public enum SideEffect<E> {
     }
 }
 
+public enum ReducerResult<E> {
+    case ignore
+    case resolve(SideEffect<E>)
+}
+
 public struct Reducer<E, S> {
-    public typealias Operation = (inout S, Action) -> SideEffect<E>?
+    public typealias Operation = (inout S, Action) -> ReducerResult<E>
     private let _operation: Operation
     public init<A>(_ operation: @escaping (inout S, A) -> SideEffect<E>) where A: Action {
         _operation = { state, action in
             if let action = action as? A {
-                return operation(&state, action)
+                return .resolve(operation(&state, action))
             }
-            return nil
+            return .ignore
         }
     }
 
-    public func reduce(state: inout S, action: Action) -> SideEffect<E>? {
+    public func reduce(state: inout S, action: Action) -> ReducerResult<E> {
         _operation(&state, action)
-    }
-}
-
-public struct Middleware<S> {
-    public typealias PreOperation = (S, Action) -> Action?
-    public typealias PostOperation = (S, Action) -> Void
-    private let _pre: PreOperation?
-    private let _post: PostOperation?
-    public init<A>(pre: ((S, A) -> Action)?,
-                   post: ((S, A) -> Void)?) where A: Action
-    {
-        _pre = { state, action in
-            if let pre = pre,
-               let action = action as? A
-            {
-                return pre(state, action)
-            }
-            return nil
-        }
-
-        _post = { state, action in
-            if let post = post,
-               let action = action as? A
-            {
-                post(state, action)
-            }
-        }
-    }
-
-    public func pre(state: S, action: Action) -> Action? {
-        _pre?(state, action)
-    }
-
-    public func post(state: S, action: Action) {
-        _post?(state, action)
     }
 }
 
@@ -89,50 +60,34 @@ public actor Service<E, S>: StatefulReducer {
     private let _environment: E
     private let _store: Store<S>
     private var _reducers: [Reducer<E, S>]
-    private var _middlewares: [Middleware<S>]
 
     public init(environment: E, store: Store<S>) {
         _environment = environment
         _store = store
         _reducers = []
-        _middlewares = []
     }
 
     public func add<A>(reducer: @escaping (inout S, A) -> SideEffect<E>) where A: Action {
         _reducers.append(Reducer(reducer))
     }
 
-    public func add<A>(pre: ((S, A) -> Action)? = nil,
-                       post: ((S, A) -> Void)? = nil) where A: Action
-    {
-        _middlewares.append(Middleware(pre: pre, post: post))
-    }
-
-    fileprivate func reduce(action: Action) async -> SideEffectWrapper? {
+    fileprivate func reduce(action: Action) async -> StatefulReducerResult {
         var sideEffects: [SideEffect<E>] = []
         for reducer in _reducers {
-            let result = await _store.update {(state: inout S) -> SideEffect<E>? in
-                var newState = state
-                for middleware in _middlewares {
-                    if let newAction = middleware.pre(state: state, action: action) {
-                        await reduce(action: newAction)
-                        return nil
-                    }
-                }
-                let sideEffect = reducer.reduce(state: &state, action: action)
-                for middleware in _middlewares {
-                    middleware.post(state: state, action: action)
-                }
-                return sideEffect
+            let result = await _store.update { (state: inout S) -> ReducerResult<E> in
+                reducer.reduce(state: &state, action: action)
             }
 
-            if let sideEffect = result {
+            switch result {
+            case .ignore:
+                continue
+            case let .resolve(sideEffect):
                 sideEffects.append(sideEffect)
             }
         }
 
         if !sideEffects.isEmpty {
-            return { [weak self] dispatcher in
+            return .resolve { [weak self] dispatcher in
                 for sideEffect in sideEffects {
                     if let self = self,
                        case let .sideEffects(operation) = sideEffect
@@ -142,15 +97,19 @@ public actor Service<E, S>: StatefulReducer {
                 }
             }
         } else {
-            return nil
+            return .ignore
         }
     }
 }
 
-private typealias SideEffectWrapper = (Dispatcher) async throws -> Void
+private enum StatefulReducerResult {
+    typealias Resolver = (Dispatcher) async throws -> Void
+    case ignore
+    case resolve(Resolver)
+}
 
 private protocol StatefulReducer: AnyObject {
-    func reduce(action: Action) async -> SideEffectWrapper?
+    func reduce(action: Action) async -> StatefulReducerResult
 }
 
 @MainActor
@@ -169,16 +128,21 @@ public class Dispatcher {
 
     public func mutate<A>(action: A) where A: Action {
         Task {
-            var sideEffects: [SideEffectWrapper] = []
+            var resolvers: [StatefulReducerResult.Resolver] = []
             for service in _services.values {
-                if let sideEffect = await service.reduce(action: action) {
-                    sideEffects.append(sideEffect)
+                let result = await service.reduce(action: action)
+
+                switch result {
+                case .ignore:
+                    continue
+                case let .resolve(resolver):
+                    resolvers.append(resolver)
                 }
             }
 
-            for sideEffect in sideEffects {
+            for resolver in resolvers {
                 do {
-                    try await sideEffect(self)
+                    try await resolver(self)
                 } catch {
                     mutate(action: action.transform(error: error))
                 }
