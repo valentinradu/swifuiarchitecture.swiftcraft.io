@@ -11,237 +11,178 @@ public protocol Action {
     func transform(error: Error) -> Self
 }
 
-public struct OldSideEffect<D> {
-    public typealias Operation = (Dispatcher, D) async throws -> Void
-    private let _operation: Operation?
-    public static var noop: OldSideEffect<D> { OldSideEffect<D>() }
-
-    public init(_ operation: @escaping Operation) {
-        _operation = operation
-    }
-
-    private init() {
-        _operation = nil
-    }
-
-    fileprivate var hasOperation: Bool {
-        _operation != nil
-    }
-
-    fileprivate func callAsFunction(_ dispatcher: Dispatcher, dependencies: D) async throws {
-        guard let operation = _operation else {
-            assertionFailure()
-            return
-        }
-        try await operation(dispatcher, dependencies)
-    }
-}
-
-private struct AnyReducer {
-    typealias Operation = (Dispatcher) async throws -> Void
-    private let _reduce: (Action) -> Operation?
-
-    init<S, D, A>(store: Store<S>,
-                  dependencies: D,
-                  reducer: @escaping (inout S, A) -> OldSideEffect<D>)
-    {
-        _reduce = { action in
-            if let action = action as? A {
-                let sideEffect = reducer(&store.state, action)
-                if sideEffect.hasOperation {
-                    return {
-                        try await sideEffect($0, dependencies: dependencies)
-                    }
-                }
-            }
-            return nil
-        }
-    }
-
-    func mutate<A: Action>(action: A) -> Operation? {
-        _reduce(action)
-    }
-}
-
-public protocol OldService {
-    typealias Reducer = (inout S, A) -> OldSideEffect<D>
-    associatedtype S
-    associatedtype A: Action
-    associatedtype D
-    func bootstrap() async -> ServiceBootstrap<S, A, D>
-}
-
-public struct ServiceBootstrap<S, A, D> where A: Action {
-    typealias Reducer = (inout S, A) -> OldSideEffect<D>
-    let state: S
-    let dependencies: D
-    let reducers: [Reducer]
-}
-
-public class UnregisterToken<T> {
-    private let _closure: () async -> Void
-    public init(_ closure: @escaping () async -> Void) {
-        _closure = closure
-    }
-
-    deinit {
-        Task { [_closure] in
-            await _closure()
-        }
-    }
-}
-
-public actor Dispatcher {
-    private var _reducers: [UUID: AnyReducer] = [:]
-
-    public func register<T: OldService>(service: T) async -> UnregisterToken<T> {
-        let bootstrap = await service.bootstrap()
-        var uuids: Set<UUID> = []
-        for reducer in bootstrap.reducers {
-            let uuid = UUID()
-            let reducer = AnyReducer(store: Store(bootstrap.state),
-                                     dependencies: bootstrap.dependencies,
-                                     reducer: reducer)
-
-            _reducers[uuid] = reducer
-            uuids.insert(uuid)
-        }
-
-        return UnregisterToken { [weak self, uuids] in
-            await self?.removeServices(uuids: uuids)
-        }
-    }
-
-    private func removeServices(uuids: Set<UUID>) {
-        for uuid in uuids {
-            _reducers.removeValue(forKey: uuid)
-        }
-    }
-
-    public func mutate<M>(_ action: M) where M: Action {
-        var sideEffects: [AnyReducer.Operation] = []
-        for reducer in _reducers.values {
-            if let sideEffect = reducer.mutate(action: action) {
-                sideEffects.append(sideEffect)
-            }
-        }
-
-        Task { [sideEffects] in
-            for sideEffect in sideEffects {
-                do {
-                    try await sideEffect(self)
-                } catch {
-                    mutate(action.transform(error: error))
-                }
-            }
-        }
-    }
-}
-
-// -------------------------------------------------------------------------
-
-public class Store<State> {
-    fileprivate var state: State
+public actor Store<State> {
+    private var state: State
 
     public init(_ state: State) {
         self.state = state
+    }
+
+    public func update<T>(_ closure: (inout State) -> T) -> T {
+        closure(&state)
     }
 }
 
 public enum SideEffect<E> {
     public typealias Operation = (Dispatcher, E) async throws -> Void
     case noop
-    case sideEffects(Operation, E)
-}
+    case sideEffects(Operation)
 
-public protocol Service {}
-
-public struct EmptyService: Service {
-    public func add<E>(environment: E) -> EnvironmentService<E> {
-        EnvironmentService(environment: environment)
-    }
-
-    public func add<S>(initialState: S) -> StatefulService<S> {
-        StatefulService(initialState: initialState)
+    public init(_ operation: @escaping Operation) {
+        self = .sideEffects(operation)
     }
 }
 
-public struct EnvironmentService<E>: Service {
-    private var _environment: E
-
-    public init(environment: E) {
-        _environment = environment
+public struct Reducer<E, S> {
+    public typealias Operation = (inout S, Action) -> SideEffect<E>?
+    private let _operation: Operation
+    public init<A>(_ operation: @escaping (inout S, A) -> SideEffect<E>) where A: Action {
+        _operation = { state, action in
+            if let action = action as? A {
+                return operation(&state, action)
+            }
+            return nil
+        }
     }
 
-    public func add<S>(initialState: S) -> StatefulEnvironmentService<S, E> {
-        StatefulEnvironmentService(initialState: initialState, environment: _environment)
-    }
-}
-
-public struct StatefulService<S>: Service {
-    private var _initialState: S
-
-    public init(initialState: S) {
-        _initialState = initialState
-    }
-
-    public func add<E>(environment: E) -> StatefulEnvironmentService<S, E> {
-        StatefulEnvironmentService(initialState: _initialState, environment: environment)
-    }
-
-    public func add<A>(reducer: @escaping (inout S, A) -> SideEffect<Never>) -> StatefulReducerService<S, A> where A: Action {
-        StatefulReducerService(initialState: _initialState, reducer: reducer)
+    public func reduce(state: inout S, action: Action) -> SideEffect<E>? {
+        _operation(&state, action)
     }
 }
 
-public struct FullService<S, E, A>: Service {
-    public typealias Reducer = (inout S, A) -> SideEffect<E>
-    private let _initialState: S
+public struct Middleware<S> {
+    public typealias PreOperation = (S, Action) -> Action?
+    public typealias PostOperation = (S, Action) -> Void
+    private let _pre: PreOperation?
+    private let _post: PostOperation?
+    public init<A>(pre: ((S, A) -> Action)?,
+                   post: ((S, A) -> Void)?) where A: Action
+    {
+        _pre = { state, action in
+            if let pre = pre,
+               let action = action as? A
+            {
+                return pre(state, action)
+            }
+            return nil
+        }
+
+        _post = { state, action in
+            if let post = post,
+               let action = action as? A
+            {
+                post(state, action)
+            }
+        }
+    }
+
+    public func pre(state: S, action: Action) -> Action? {
+        _pre?(state, action)
+    }
+
+    public func post(state: S, action: Action) {
+        _post?(state, action)
+    }
+}
+
+public actor Service<E, S>: StatefulReducer {
     private let _environment: E
-    private let _reducer: Reducer
+    private let _store: Store<S>
+    private var _reducers: [Reducer<E, S>]
+    private var _middlewares: [Middleware<S>]
 
-    public init(initialState: S, environment: E, reducer: @escaping Reducer) {
-        _initialState = initialState
+    public init(environment: E, store: Store<S>) {
         _environment = environment
-        _reducer = reducer
+        _store = store
+        _reducers = []
+        _middlewares = []
+    }
+
+    public func add<A>(reducer: @escaping (inout S, A) -> SideEffect<E>) where A: Action {
+        _reducers.append(Reducer(reducer))
+    }
+
+    public func add<A>(pre: ((S, A) -> Action)? = nil,
+                       post: ((S, A) -> Void)? = nil) where A: Action
+    {
+        _middlewares.append(Middleware(pre: pre, post: post))
+    }
+
+    fileprivate func reduce(action: Action) async -> SideEffectWrapper? {
+        var sideEffects: [SideEffect<E>] = []
+        for reducer in _reducers {
+            let result = await _store.update {(state: inout S) -> SideEffect<E>? in
+                var newState = state
+                for middleware in _middlewares {
+                    if let newAction = middleware.pre(state: state, action: action) {
+                        await reduce(action: newAction)
+                        return nil
+                    }
+                }
+                let sideEffect = reducer.reduce(state: &state, action: action)
+                for middleware in _middlewares {
+                    middleware.post(state: state, action: action)
+                }
+                return sideEffect
+            }
+
+            if let sideEffect = result {
+                sideEffects.append(sideEffect)
+            }
+        }
+
+        if !sideEffects.isEmpty {
+            return { [weak self] dispatcher in
+                for sideEffect in sideEffects {
+                    if let self = self,
+                       case let .sideEffects(operation) = sideEffect
+                    {
+                        try await operation(dispatcher, self._environment)
+                    }
+                }
+            }
+        } else {
+            return nil
+        }
     }
 }
 
-public struct StatefulEnvironmentService<S, E>: Service {
-    private let _initialState: S
-    private let _environment: E
+private typealias SideEffectWrapper = (Dispatcher) async throws -> Void
 
-    public init(initialState: S, environment: E) {
-        _initialState = initialState
-        _environment = environment
-    }
-
-    public func add<A>(reducer: @escaping (inout S, A) -> SideEffect<E>) -> FullService<S, E, A> where A: Action {
-        FullService(initialState: _initialState, environment: _environment, reducer: reducer)
-    }
+private protocol StatefulReducer: AnyObject {
+    func reduce(action: Action) async -> SideEffectWrapper?
 }
 
-public struct StatefulReducerService<S, A>: Service where A: Action {
-    public typealias Reducer = (inout S, A) -> SideEffect<Never>
-    private let _initialState: S
-    private let _reducer: Reducer
+@MainActor
+public class Dispatcher {
+    private var _services: [ObjectIdentifier: StatefulReducer] = [:]
 
-    public init(initialState: S, reducer: @escaping Reducer) {
-        _initialState = initialState
-        _reducer = reducer
-    }
-}
-
-public struct ServiceBuilder {
-    public func createService() -> EmptyService {
-        EmptyService()
+    public func register<E, S>(service: Service<E, S>) {
+        let id = ObjectIdentifier(service)
+        _services[id] = service
     }
 
-    func text() {
-        createService()
-            .add(initialState: AccountState(id: "", username: "", email: ""))
-            .add(reducer: { (_: inout AccountState, _: AccountAction) -> SideEffect in
-                .noop
-            })
+    public func unregister<E, S>(service: Service<E, S>) {
+        let id = ObjectIdentifier(service)
+        _services.removeValue(forKey: id)
+    }
+
+    public func mutate<A>(action: A) where A: Action {
+        Task {
+            var sideEffects: [SideEffectWrapper] = []
+            for service in _services.values {
+                if let sideEffect = await service.reduce(action: action) {
+                    sideEffects.append(sideEffect)
+                }
+            }
+
+            for sideEffect in sideEffects {
+                do {
+                    try await sideEffect(self)
+                } catch {
+                    mutate(action: action.transform(error: error))
+                }
+            }
+        }
     }
 }
